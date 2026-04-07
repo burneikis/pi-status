@@ -343,7 +343,13 @@ export default function (pi: ExtensionAPI) {
             theme.fg("dim", "..."),
           );
 
-          const lines = [pwdLine, dimLeft + dimRight];
+          const statsLine = truncateToWidth(
+            dimLeft + dimRight,
+            width,
+            theme.fg("dim", "..."),
+          );
+
+          const lines = [pwdLine, statsLine];
 
           // ── Extension statuses ────────────────────────────────────
           const statuses = footerData.getExtensionStatuses();
