@@ -172,14 +172,14 @@ function fmtReset(resets_at?: string | null): string | null {
 
 function buildParts(data: UsageData): string[] {
   const parts = [
-    fmtLimit("sn", data.five_hour),
-    fmtLimit("wk", data.seven_day),
+    fmtLimit("S", data.five_hour),
+    fmtLimit("W", data.seven_day),
   ].filter((p): p is string => p !== null);
 
   // Show soonest reset time (prefer 5-hour window if active)
   const resetStr =
     fmtReset(data.five_hour?.resets_at) ?? fmtReset(data.seven_day?.resets_at);
-  if (resetStr) parts.push(`r:${resetStr}`);
+  if (resetStr) parts.push(`R:${resetStr}`);
 
   return parts;
 }
