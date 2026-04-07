@@ -1,17 +1,195 @@
+import { readFileSync, writeFileSync } from "fs";
+import { join } from "path";
+import { homedir } from "os";
 import type { AssistantMessage } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 
+// ─── cc-usage types ───────────────────────────────────────────────────────────
+
+interface RateLimit {
+	utilization: number | null;
+	resets_at?: string | null;
+}
+
+interface ExtraUsage {
+	is_enabled: boolean;
+	monthly_limit: number | null;
+	used_credits?: number | null;
+	utilization?: number | null;
+}
+
+interface UsageData {
+	five_hour?: RateLimit;
+	seven_day?: RateLimit;
+	seven_day_sonnet?: RateLimit;
+	extra_usage?: ExtraUsage;
+}
+
+interface OAuthTokens {
+	accessToken: string;
+	refreshToken?: string;
+	expiresAt?: number;
+}
+
+// ─── Token management ─────────────────────────────────────────────────────────
+
+const CREDS_PATH = join(homedir(), ".claude", ".credentials.json");
+const TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
+const CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const API_URL = "https://api.anthropic.com/api/oauth/usage";
+const POLL_INTERVAL_MS = 60_000;
+
+function readCreds(): any {
+	return JSON.parse(readFileSync(CREDS_PATH, "utf8"));
+}
+
+function writeCreds(creds: any): void {
+	writeFileSync(CREDS_PATH, JSON.stringify(creds, null, 2), "utf8");
+}
+
+function loadTokens(): OAuthTokens | null {
+	try {
+		const oauth = readCreds()?.claudeAiOauth;
+		if (!oauth?.accessToken) return null;
+		return oauth as OAuthTokens;
+	} catch {
+		return null;
+	}
+}
+
+function isExpired(tokens: OAuthTokens): boolean {
+	if (!tokens.expiresAt) return false;
+	return Date.now() >= tokens.expiresAt - 60_000;
+}
+
+async function refreshTokens(tokens: OAuthTokens): Promise<OAuthTokens> {
+	const res = await fetch(TOKEN_URL, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({
+			grant_type: "refresh_token",
+			refresh_token: tokens.refreshToken,
+			client_id: CLIENT_ID,
+		}),
+		signal: AbortSignal.timeout(15_000),
+	});
+
+	if (!res.ok) {
+		const body = await res.text().catch(() => "");
+		throw new Error(`Token refresh failed (${res.status}): ${body.slice(0, 200)}`);
+	}
+
+	const data = await res.json();
+	const newTokens: OAuthTokens = {
+		...tokens,
+		accessToken: data.access_token,
+		refreshToken: data.refresh_token ?? tokens.refreshToken,
+		expiresAt: Date.now() + data.expires_in * 1000,
+	};
+
+	try {
+		const creds = readCreds();
+		creds.claudeAiOauth = newTokens;
+		writeCreds(creds);
+	} catch {
+		// non-fatal
+	}
+
+	return newTokens;
+}
+
+async function fetchUsage(tokens: OAuthTokens): Promise<UsageData> {
+	const res = await fetch(API_URL, {
+		headers: {
+			Authorization: `Bearer ${tokens.accessToken}`,
+			"Content-Type": "application/json",
+			"anthropic-beta": "oauth-2025-04-20",
+		},
+		signal: AbortSignal.timeout(8_000),
+	});
+	if (!res.ok) {
+		const body = await res.text().catch(() => "");
+		throw new Error(`HTTP ${res.status}: ${body.slice(0, 200)}`);
+	}
+	return res.json() as Promise<UsageData>;
+}
+
+// ─── Compact rendering helpers ────────────────────────────────────────────────
+
+function worstPct(data: UsageData): number {
+	const vals = [
+		data.five_hour?.utilization,
+		data.seven_day?.utilization,
+	].filter((v): v is number => typeof v === "number");
+	return vals.length ? Math.max(...vals) : 0;
+}
+
+function fmtLimit(label: string, limit?: RateLimit): string | null {
+	if (!limit || limit.utilization === null || limit.utilization === undefined) return null;
+	return `${label}:${Math.floor(limit.utilization)}%`;
+}
+
+function buildParts(data: UsageData): string[] {
+	return [
+		fmtLimit("session", data.five_hour),
+		fmtLimit("week", data.seven_day),
+	].filter((p): p is string => p !== null);
+}
+
+// ─── Extension ────────────────────────────────────────────────────────────────
+
 export default function (pi: ExtensionAPI) {
 	pi.on("session_start", (_event, ctx) => {
+		// cc-usage polling state
+		let tokens: OAuthTokens | null = loadTokens();
+		let usageData: UsageData | null = null;
+		let usageError: string | null = null;
+		let pollTimer: ReturnType<typeof setInterval> | null = null;
+		let renderFn: (() => void) | null = null;
+
+		async function pollUsage() {
+			try {
+				// Re-read from disk in case Claude Code refreshed them
+				tokens = loadTokens();
+				if (!tokens) {
+					usageError = "no creds";
+					renderFn?.();
+					return;
+				}
+				if (isExpired(tokens)) {
+					tokens = await refreshTokens(tokens);
+				}
+				usageData = await fetchUsage(tokens);
+				usageError = null;
+			} catch (err: any) {
+				usageError = err?.message ?? "unknown error";
+			}
+			renderFn?.();
+		}
+
+		// Kick off polling
+		pollUsage();
+		pollTimer = setInterval(pollUsage, POLL_INTERVAL_MS);
+
 		ctx.ui.setFooter((tui, theme, footerData) => {
 			const unsub = footerData.onBranchChange(() => tui.requestRender());
 
+			// Wire up render trigger
+			renderFn = () => tui.requestRender();
+
 			return {
-				dispose: unsub,
+				dispose: () => {
+					unsub();
+					renderFn = null;
+					if (pollTimer) {
+						clearInterval(pollTimer);
+						pollTimer = null;
+					}
+				},
 				invalidate() {},
 				render(width: number): string[] {
-					// Calculate cost from session
+					// ── Session cost ──────────────────────────────────────────
 					let totalCost = 0;
 					for (const entry of ctx.sessionManager.getBranch()) {
 						if (entry.type === "message" && entry.message.role === "assistant") {
@@ -20,7 +198,7 @@ export default function (pi: ExtensionAPI) {
 						}
 					}
 
-					// Context usage
+					// ── Context usage ─────────────────────────────────────────
 					const contextUsage = ctx.getContextUsage();
 					const contextWindow = contextUsage?.contextWindow ?? 0;
 					const contextPercent = contextUsage?.percent !== null ? contextUsage?.percent?.toFixed(1) : "?";
@@ -34,7 +212,6 @@ export default function (pi: ExtensionAPI) {
 						return `${Math.round(n / 1000000)}M`;
 					};
 
-					// Context with color coding
 					const contextDisplay = `${contextPercent}%/${fmt(contextWindow)}`;
 					let contextStr: string;
 					if (contextPercentValue > 90) {
@@ -47,7 +224,7 @@ export default function (pi: ExtensionAPI) {
 
 					const left = `$${totalCost.toFixed(3)}  ${contextStr}`;
 
-					// Model + thinking on the right
+					// ── Model + thinking ──────────────────────────────────────
 					const modelName = ctx.model?.id || "no-model";
 					let right = modelName;
 					if (ctx.model?.reasoning) {
@@ -55,7 +232,7 @@ export default function (pi: ExtensionAPI) {
 						right = level === "off" ? `${modelName} • thinking off` : `${modelName} • ${level}`;
 					}
 
-					// pwd line
+					// ── pwd + branch ──────────────────────────────────────────
 					let pwd = process.cwd();
 					const home = process.env.HOME || process.env.USERPROFILE;
 					if (home && pwd.startsWith(home)) {
@@ -66,11 +243,10 @@ export default function (pi: ExtensionAPI) {
 					const sessionName = ctx.sessionManager.getSessionName();
 					if (sessionName) pwd = `${pwd} • ${sessionName}`;
 
-					// Layout: left stats + right-aligned model
+					// ── Layout: stats line ────────────────────────────────────
 					const leftWidth = visibleWidth(left);
 					const rightWidth = visibleWidth(right);
 					const pad = " ".repeat(Math.max(2, width - leftWidth - rightWidth));
-					const statsLine = left + pad + right;
 
 					const dimLeft = theme.fg("dim", left);
 					const dimRight = theme.fg("dim", pad + right);
@@ -79,7 +255,7 @@ export default function (pi: ExtensionAPI) {
 
 					const lines = [pwdLine, dimLeft + dimRight];
 
-					// Extension statuses
+					// ── Extension statuses ────────────────────────────────────
 					const statuses = footerData.getExtensionStatuses();
 					if (statuses.size > 0) {
 						const statusLine = Array.from(statuses.entries())
@@ -87,6 +263,21 @@ export default function (pi: ExtensionAPI) {
 							.map(([, text]) => text.replace(/[\r\n\t]/g, " ").replace(/ +/g, " ").trim())
 							.join(" ");
 						lines.push(truncateToWidth(statusLine, width, theme.fg("dim", "...")));
+					}
+
+					// ── cc-usage line ─────────────────────────────────────────
+					if (usageError) {
+						lines.push(theme.fg("dim", `CC: ${usageError}`));
+					} else if (usageData) {
+						const parts = buildParts(usageData);
+						if (parts.length > 0) {
+							const worst = worstPct(usageData);
+							const colorKey = worst >= 80 ? "error" : worst >= 50 ? "warning" : "success";
+							const usageLine = `CC ${parts.join(" | ")}`;
+							lines.push(truncateToWidth(theme.fg(colorKey, usageLine), width, theme.fg("dim", "...")));
+						}
+					} else {
+						lines.push(theme.fg("dim", "CC: loading…"));
 					}
 
 					return lines;
