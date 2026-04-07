@@ -223,17 +223,26 @@ export default function (pi: ExtensionAPI) {
 					}
 
 					// ── cc-usage inline ──────────────────────────────────────
-					let usageStr = "";
+					let usagePlain = "";
+					let usageColored = "";
 					if (usageData) {
 						const parts = buildParts(usageData);
 						if (parts.length > 0) {
+							const text = "  " + parts.join(" ");
+							usagePlain = text;
 							const worst = worstPct(usageData);
-							const colorKey = worst >= 80 ? "error" : worst >= 50 ? "warning" : "success";
-							usageStr = "  " + theme.fg(colorKey, parts.join(" "));
+							if (worst >= 80) {
+								usageColored = "  " + theme.fg("error", parts.join(" "));
+							} else if (worst >= 50) {
+								usageColored = "  " + theme.fg("warning", parts.join(" "));
+							} else {
+								usageColored = theme.fg("dim", text);
+							}
 						}
 					}
 
-					const left = `$${totalCost.toFixed(3)}  ${contextStr}${usageStr}`;
+					const leftBase = `$${totalCost.toFixed(3)}  ${contextStr}`;
+					const left = leftBase + usagePlain;
 
 					// ── Model + thinking ──────────────────────────────────────
 					const modelName = ctx.model?.id || "no-model";
@@ -259,7 +268,7 @@ export default function (pi: ExtensionAPI) {
 					const rightWidth = visibleWidth(right);
 					const pad = " ".repeat(Math.max(2, width - leftWidth - rightWidth));
 
-					const dimLeft = theme.fg("dim", left);
+					const dimLeft = theme.fg("dim", leftBase) + usageColored;
 					const dimRight = theme.fg("dim", pad + right);
 
 					const pwdLine = truncateToWidth(theme.fg("dim", pwd), width, theme.fg("dim", "..."));
