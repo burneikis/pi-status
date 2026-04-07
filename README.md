@@ -3,10 +3,10 @@
 Minimal status bar for [pi](https://github.com/badlogic/pi-mono). Replaces the default footer with just the essentials:
 
 ```
-$0.229  2.7%/1.0M                                        claude-opus-4-6 • medium
+$0.229  2.7%/1.0M sn:22% wk:50% ⟳4h09m                   claude-opus-4-6 • medium
 ```
 
-Shows **cost**, **context usage** (color-coded), **model**, and **thinking level**.
+Shows **cost**, **context usage** (color-coded), **plan usage** (color-coded), **model**, and **thinking level**.
 
 ## Install
 
