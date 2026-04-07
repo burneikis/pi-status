@@ -35,10 +35,12 @@ interface OAuthTokens {
 // ─── Token management ─────────────────────────────────────────────────────────
 
 const CREDS_PATH = join(homedir(), ".claude", ".credentials.json");
+const USAGE_CACHE_PATH = join(homedir(), ".claude", ".pi-usage-cache.json");
 const TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
 const CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const API_URL = "https://api.anthropic.com/api/oauth/usage";
 const POLL_INTERVAL_MS = 60_000;
+const CACHE_TTL_MS = 5 * 60_000; // 5 minutes
 
 function readCreds(): any {
 	return JSON.parse(readFileSync(CREDS_PATH, "utf8"));
@@ -97,6 +99,30 @@ async function refreshTokens(tokens: OAuthTokens): Promise<OAuthTokens> {
 	}
 
 	return newTokens;
+}
+
+// ─── Usage cache ─────────────────────────────────────────────────────────────
+
+interface UsageCache {
+	timestamp: number;
+	data: UsageData;
+}
+
+function readUsageCache(): UsageCache | null {
+	try {
+		return JSON.parse(readFileSync(USAGE_CACHE_PATH, "utf8")) as UsageCache;
+	} catch {
+		return null;
+	}
+}
+
+function writeUsageCache(data: UsageData): void {
+	try {
+		const cache: UsageCache = { timestamp: Date.now(), data };
+		writeFileSync(USAGE_CACHE_PATH, JSON.stringify(cache), "utf8");
+	} catch {
+		// non-fatal
+	}
 }
 
 async function fetchUsage(tokens: OAuthTokens): Promise<UsageData> {
@@ -169,7 +195,16 @@ export default function (pi: ExtensionAPI) {
 
 		async function pollUsage() {
 			try {
-				// Re-read from disk in case Claude Code refreshed them
+				// Check shared cache first — avoids rate limits with multiple instances
+				const cache = readUsageCache();
+				if (cache && Date.now() - cache.timestamp < CACHE_TTL_MS) {
+					usageData = cache.data;
+					usageError = null;
+					renderFn?.();
+					return;
+				}
+
+				// Cache is stale or missing — fetch fresh data
 				tokens = loadTokens();
 				if (!tokens) {
 					usageError = "no creds";
@@ -180,6 +215,7 @@ export default function (pi: ExtensionAPI) {
 					tokens = await refreshTokens(tokens);
 				}
 				usageData = await fetchUsage(tokens);
+				writeUsageCache(usageData);
 				usageError = null;
 			} catch (err: any) {
 				usageError = err?.message ?? "unknown error";
