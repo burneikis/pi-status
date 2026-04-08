@@ -146,8 +146,12 @@ async function fetchUsage(tokens: OAuthTokens): Promise<UsageData> {
 // ─── Compact rendering helpers ────────────────────────────────────────────────
 
 function worstPct(data: UsageData): number {
-  const util = data.extra_usage?.utilization;
-  return typeof util === "number" ? util * 100 : 0;
+  const extra = data.extra_usage;
+  if (!extra?.is_enabled) return 0;
+  const used = extra.used_credits ?? null;
+  const limit = extra.monthly_limit ?? null;
+  if (used === null || limit === null || limit === 0) return 0;
+  return Math.floor((used / limit) * 100);
 }
 
 function fmtExtra(extra?: ExtraUsage): string | null {
