@@ -155,8 +155,10 @@ function fmtExtra(extra?: ExtraUsage): string | null {
   const used = extra.used_credits ?? null;
   const limit = extra.monthly_limit ?? null;
   if (used === null || limit === null) return null;
-  const pct = limit > 0 ? Math.floor((used / limit) * 100) : 0;
-  return `extra: $${used.toFixed(2)}/$${limit.toFixed(2)} (${pct}%)`;
+  const usedDollars = used / 100;
+  const limitDollars = limit / 100;
+  const pct = limitDollars > 0 ? Math.floor((usedDollars / limitDollars) * 100) : 0;
+  return `$${usedDollars.toFixed(2)}/$${limitDollars.toFixed(2)} (${pct}%)`;
 }
 
 function buildParts(data: UsageData): string[] {
