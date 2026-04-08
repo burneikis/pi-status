@@ -146,42 +146,22 @@ async function fetchUsage(tokens: OAuthTokens): Promise<UsageData> {
 // ─── Compact rendering helpers ────────────────────────────────────────────────
 
 function worstPct(data: UsageData): number {
-  const vals = [
-    data.five_hour?.utilization,
-    data.seven_day?.utilization,
-  ].filter((v): v is number => typeof v === "number");
-  return vals.length ? Math.max(...vals) : 0;
+  const util = data.extra_usage?.utilization;
+  return typeof util === "number" ? util * 100 : 0;
 }
 
-function fmtLimit(label: string, limit?: RateLimit): string | null {
-  if (!limit || limit.utilization === null || limit.utilization === undefined)
-    return null;
-  return `${label}:${Math.floor(limit.utilization)}%`;
-}
-
-function fmtReset(resets_at?: string | null): string | null {
-  if (!resets_at) return null;
-  const ms = new Date(resets_at).getTime() - Date.now();
-  if (ms <= 0) return "now";
-  const totalSec = Math.floor(ms / 1000);
-  const h = Math.floor(totalSec / 3600);
-  const m = Math.floor((totalSec % 3600) / 60);
-  if (h > 0) return `${h}h${m.toString().padStart(2, "0")}m`;
-  return `${m}m`;
+function fmtExtra(extra?: ExtraUsage): string | null {
+  if (!extra || !extra.is_enabled) return null;
+  const used = extra.used_credits ?? null;
+  const limit = extra.monthly_limit ?? null;
+  if (used === null || limit === null) return null;
+  const pct = limit > 0 ? Math.floor((used / limit) * 100) : 0;
+  return `extra: $${used.toFixed(2)}/$${limit.toFixed(2)} (${pct}%)`;
 }
 
 function buildParts(data: UsageData): string[] {
-  const parts = [
-    fmtLimit("S", data.five_hour),
-    fmtLimit("W", data.seven_day),
-  ].filter((p): p is string => p !== null);
-
-  // Show soonest reset time (prefer 5-hour window if active)
-  const resetStr =
-    fmtReset(data.five_hour?.resets_at) ?? fmtReset(data.seven_day?.resets_at);
-  if (resetStr) parts.push(`R:${resetStr}`);
-
-  return parts;
+  const extra = fmtExtra(data.extra_usage);
+  return extra ? [extra] : [];
 }
 
 // ─── Extension ────────────────────────────────────────────────────────────────
