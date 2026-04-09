@@ -108,6 +108,7 @@ async function refreshTokens(tokens: OAuthTokens): Promise<OAuthTokens> {
 interface UsageCache {
   timestamp: number;
   data: UsageData;
+  rate_limited_until?: number;
 }
 
 function readUsageCache(): UsageCache | null {
@@ -166,20 +167,20 @@ function fmtReset(resets_at?: string | null): string | null {
   const totalSec = Math.floor(ms / 1000);
   const h = Math.floor(totalSec / 3600);
   const m = Math.floor((totalSec % 3600) / 60);
-  if (h > 0) return `${h}h${m.toString().padStart(2, "0")}m`;
+  if (h > 0) return `${h}h${m}m`;
   return `${m}m`;
 }
 
 function buildParts(data: UsageData): string[] {
   const parts = [
-    fmtLimit("S", data.five_hour),
-    fmtLimit("W", data.seven_day),
+    fmtLimit("5h", data.five_hour),
+    fmtLimit("7d", data.seven_day),
   ].filter((p): p is string => p !== null);
 
   // Show soonest reset time (prefer 5-hour window if active)
   const resetStr =
     fmtReset(data.five_hour?.resets_at) ?? fmtReset(data.seven_day?.resets_at);
-  if (resetStr) parts.push(`R:${resetStr}`);
+  if (resetStr) parts.push(`↺${resetStr}`);
 
   return parts;
 }
@@ -199,11 +200,20 @@ export default function (pi: ExtensionAPI) {
       try {
         // Check shared cache first — avoids rate limits with multiple instances
         const cache = readUsageCache();
-        if (cache && Date.now() - cache.timestamp < CACHE_TTL_MS) {
-          usageData = cache.data;
-          usageError = null;
-          renderFn?.();
-          return;
+        if (cache) {
+          // Serve stale cache if we are in a rate-limit backoff window
+          if (cache.rate_limited_until && Date.now() < cache.rate_limited_until) {
+            usageData = cache.data;
+            usageError = null;
+            renderFn?.();
+            return;
+          }
+          if (Date.now() - cache.timestamp < CACHE_TTL_MS) {
+            usageData = cache.data;
+            usageError = null;
+            renderFn?.();
+            return;
+          }
         }
 
         // Cache is stale or missing — fetch fresh data
@@ -220,7 +230,25 @@ export default function (pi: ExtensionAPI) {
         writeUsageCache(usageData);
         usageError = null;
       } catch (err: any) {
-        usageError = err?.message ?? "unknown error";
+        const msg: string = err?.message ?? "unknown error";
+        // On rate limit, record a backoff deadline in the cache so all
+        // instances (including statusline-command.sh) honour it
+        if (msg.includes("429")) {
+          try {
+            const existing = readUsageCache();
+            const backoffMs = 5 * 60_000;
+            const patched: UsageCache = {
+              timestamp: existing?.timestamp ?? Date.now(),
+              data: existing?.data ?? {},
+              rate_limited_until: Date.now() + backoffMs,
+            };
+            writeFileSync(USAGE_CACHE_PATH, JSON.stringify(patched), "utf8");
+            if (existing?.data) usageData = existing.data;
+          } catch {
+            // non-fatal
+          }
+        }
+        usageError = msg;
       }
       renderFn?.();
     }
