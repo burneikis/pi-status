@@ -39,7 +39,7 @@ const USAGE_CACHE_PATH = join(homedir(), ".claude", ".pi-usage-cache.json");
 const TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
 const CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const API_URL = "https://api.anthropic.com/api/oauth/usage";
-const POLL_INTERVAL_MS = 60_000;
+const POLL_INTERVAL_MS = 120_000;
 const CACHE_TTL_MS = 5 * 60_000; // 5 minutes
 
 function readCreds(): any {
@@ -108,6 +108,8 @@ async function refreshTokens(tokens: OAuthTokens): Promise<OAuthTokens> {
 interface UsageCache {
   timestamp: number;
   data: UsageData;
+  rate_limited_until?: number;
+  rate_limit_count?: number;
 }
 
 function readUsageCache(): UsageCache | null {
@@ -166,20 +168,20 @@ function fmtReset(resets_at?: string | null): string | null {
   const totalSec = Math.floor(ms / 1000);
   const h = Math.floor(totalSec / 3600);
   const m = Math.floor((totalSec % 3600) / 60);
-  if (h > 0) return `${h}h${m.toString().padStart(2, "0")}m`;
+  if (h > 0) return `${h}h${m}m`;
   return `${m}m`;
 }
 
 function buildParts(data: UsageData): string[] {
   const parts = [
-    fmtLimit("S", data.five_hour),
-    fmtLimit("W", data.seven_day),
+    fmtLimit("5h", data.five_hour),
+    fmtLimit("7d", data.seven_day),
   ].filter((p): p is string => p !== null);
 
   // Show soonest reset time (prefer 5-hour window if active)
   const resetStr =
     fmtReset(data.five_hour?.resets_at) ?? fmtReset(data.seven_day?.resets_at);
-  if (resetStr) parts.push(`R:${resetStr}`);
+  if (resetStr) parts.push(`↺${resetStr}`);
 
   return parts;
 }
@@ -199,11 +201,20 @@ export default function (pi: ExtensionAPI) {
       try {
         // Check shared cache first — avoids rate limits with multiple instances
         const cache = readUsageCache();
-        if (cache && Date.now() - cache.timestamp < CACHE_TTL_MS) {
-          usageData = cache.data;
-          usageError = null;
-          renderFn?.();
-          return;
+        if (cache) {
+          // Serve stale cache if we are in a rate-limit backoff window
+          if (cache.rate_limited_until && Date.now() < cache.rate_limited_until) {
+            usageData = cache.data;
+            usageError = null;
+            renderFn?.();
+            return;
+          }
+          if (Date.now() - cache.timestamp < CACHE_TTL_MS) {
+            usageData = cache.data;
+            usageError = null;
+            renderFn?.();
+            return;
+          }
         }
 
         // Cache is stale or missing — fetch fresh data
@@ -217,10 +228,45 @@ export default function (pi: ExtensionAPI) {
           tokens = await refreshTokens(tokens);
         }
         usageData = await fetchUsage(tokens);
-        writeUsageCache(usageData);
+        // Successful fetch — reset rate-limit counter
+        try {
+          const existing = readUsageCache();
+          if (existing?.rate_limit_count) {
+            writeFileSync(
+              USAGE_CACHE_PATH,
+              JSON.stringify({ timestamp: Date.now(), data: usageData }),
+              "utf8",
+            );
+          } else {
+            writeUsageCache(usageData);
+          }
+        } catch {
+          writeUsageCache(usageData);
+        }
         usageError = null;
       } catch (err: any) {
-        usageError = err?.message ?? "unknown error";
+        const msg: string = err?.message ?? "unknown error";
+        // On rate limit, record a backoff deadline in the cache so all
+        // instances (including statusline-command.sh) honour it
+        if (msg.includes("429")) {
+          try {
+            const existing = readUsageCache();
+            const count = (existing?.rate_limit_count ?? 0) + 1;
+            const backoffMs =
+              count === 1 ? 5 * 60_000 : count === 2 ? 10 * 60_000 : 30 * 60_000;
+            const patched: UsageCache = {
+              timestamp: existing?.timestamp ?? Date.now(),
+              data: existing?.data ?? {},
+              rate_limited_until: Date.now() + backoffMs,
+              rate_limit_count: count,
+            };
+            writeFileSync(USAGE_CACHE_PATH, JSON.stringify(patched), "utf8");
+            if (existing?.data) usageData = existing.data;
+          } catch {
+            // non-fatal
+          }
+        }
+        usageError = msg;
       }
       renderFn?.();
     }
