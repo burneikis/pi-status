@@ -1,6 +1,7 @@
-import { readFileSync, writeFileSync } from "fs";
+import { readFileSync, writeFileSync, existsSync } from "fs";
 import { join } from "path";
-import { homedir } from "os";
+import { homedir, userInfo } from "os";
+import { execFileSync } from "child_process";
 import type { AssistantMessage } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
@@ -42,11 +43,58 @@ const API_URL = "https://api.anthropic.com/api/oauth/usage";
 const POLL_INTERVAL_MS = 120_000;
 const CACHE_TTL_MS = 5 * 60_000; // 5 minutes
 
+const IS_MACOS = process.platform === "darwin";
+const KEYCHAIN_SERVICE = "Claude Code-credentials";
+const KEYCHAIN_ACCOUNT = userInfo().username;
+
+function readCredsFromKeychain(): any {
+  const raw = execFileSync(
+    "security",
+    ["find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT, "-w"],
+    { encoding: "utf8" },
+  ).trim();
+
+  let json: string;
+  if (/^[0-9a-f]+$/i.test(raw)) {
+    json = Buffer.from(raw, "hex").toString("utf8");
+  } else {
+    json = raw.replace(/\\n/g, "\n");
+  }
+  return JSON.parse(json);
+}
+
+function writeCredsToKeychain(creds: any): void {
+  const json = JSON.stringify(creds); // compact — no newlines
+  try {
+    execFileSync("security", [
+      "delete-generic-password",
+      "-s", KEYCHAIN_SERVICE,
+      "-a", KEYCHAIN_ACCOUNT,
+    ]);
+  } catch {
+    // ignore — entry may not exist yet
+  }
+  execFileSync("security", [
+    "add-generic-password",
+    "-s", KEYCHAIN_SERVICE,
+    "-a", KEYCHAIN_ACCOUNT,
+    "-w", json,
+    "-U",
+  ]);
+}
+
 function readCreds(): any {
+  if (IS_MACOS && !existsSync(CREDS_PATH)) {
+    return readCredsFromKeychain();
+  }
   return JSON.parse(readFileSync(CREDS_PATH, "utf8"));
 }
 
 function writeCreds(creds: any): void {
+  if (IS_MACOS && !existsSync(CREDS_PATH)) {
+    writeCredsToKeychain(creds);
+    return;
+  }
   writeFileSync(CREDS_PATH, JSON.stringify(creds, null, 2), "utf8");
 }
 
