@@ -220,6 +220,16 @@ function fmtReset(resets_at?: string | null): string | null {
   return `${m}m`;
 }
 
+function fmtExtra(extra?: ExtraUsage): string | null {
+  if (!extra || !extra.is_enabled) return null;
+  const used = extra.used_credits ?? null;
+  const limit = extra.monthly_limit ?? null;
+  if (used === null || limit === null) return null;
+  const usedDollars = used / 100;
+  const limitDollars = limit / 100;
+  return `$${usedDollars.toFixed(2)}/$${limitDollars.toFixed(2)}`;
+}
+
 function buildParts(data: UsageData): string[] {
   const parts = [
     fmtLimit("5h", data.five_hour),
@@ -231,6 +241,7 @@ function buildParts(data: UsageData): string[] {
     fmtReset(data.five_hour?.resets_at) ?? fmtReset(data.seven_day?.resets_at);
   if (resetStr) parts.push(`↺${resetStr}`);
 
+  const extra = fmtExtra(data.extra_usage);
   return parts;
 }
 
@@ -394,6 +405,22 @@ export default function (pi: ExtensionAPI) {
                 usageColored = "  " + theme.fg("warning", parts.join(" "));
               } else {
                 usageColored = theme.fg("dim", text);
+              }
+            }
+            const extraStr = fmtExtra(usageData.extra_usage);
+            if (extraStr) {
+              usagePlain += " " + extraStr;
+              const eu = usageData.extra_usage!;
+              const extraPct =
+                eu.used_credits != null && eu.monthly_limit
+                  ? (eu.used_credits / eu.monthly_limit) * 100
+                  : 0;
+              if (extraPct >= 80) {
+                usageColored += " " + theme.fg("error", extraStr);
+              } else if (extraPct >= 50) {
+                usageColored += " " + theme.fg("warning", extraStr);
+              } else {
+                usageColored += theme.fg("dim", " " + extraStr);
               }
             }
           }
