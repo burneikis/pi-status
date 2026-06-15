@@ -319,9 +319,18 @@ export default function (pi: ExtensionAPI) {
       renderFn?.();
     }
 
-    // Kick off polling
-    pollUsage();
-    pollTimer = setInterval(pollUsage, POLL_INTERVAL_MS);
+    // In non-interactive / print mode (`pi -p`) there is no TUI footer, so
+    // the footer's dispose() never runs to clear the poll timer. A live
+    // setInterval keeps the Node event loop alive and the process hangs after
+    // printing. Detect headless mode and skip background polling entirely.
+    const isHeadless = !process.stdout.isTTY || !ctx.ui?.setFooter;
+    if (!isHeadless) {
+      // Kick off polling
+      pollUsage();
+      pollTimer = setInterval(pollUsage, POLL_INTERVAL_MS);
+      // Defensive: never let the timer keep the process alive on its own.
+      pollTimer.unref?.();
+    }
 
     ctx.ui.setFooter((tui, theme, footerData) => {
       const unsub = footerData.onBranchChange(() => tui.requestRender());
