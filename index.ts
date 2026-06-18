@@ -51,7 +51,7 @@ function readCredsFromKeychain(): any {
   const raw = execFileSync(
     "security",
     ["find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT, "-w"],
-    { encoding: "utf8" },
+    { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
   ).trim();
 
   let json: string;
@@ -70,7 +70,7 @@ function writeCredsToKeychain(creds: any): void {
       "delete-generic-password",
       "-s", KEYCHAIN_SERVICE,
       "-a", KEYCHAIN_ACCOUNT,
-    ]);
+    ], { stdio: ["ignore", "ignore", "ignore"] });
   } catch {
     // ignore — entry may not exist yet
   }
@@ -80,7 +80,7 @@ function writeCredsToKeychain(creds: any): void {
     "-a", KEYCHAIN_ACCOUNT,
     "-w", json,
     "-U",
-  ]);
+  ], { stdio: ["ignore", "ignore", "ignore"] });
 }
 
 function readCreds(): any {
