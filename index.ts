@@ -2,6 +2,7 @@ import { readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
 import type { AssistantMessage } from "@mariozechner/pi-ai";
+import { getAgentDir } from "@mariozechner/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 
@@ -19,11 +20,66 @@ interface ExtraUsage {
   utilization?: number | null;
 }
 
+type LimitKind = "session" | "weekly_all" | "weekly_scoped";
+
+interface UsageLimit {
+  kind: LimitKind | string;
+  percent: number | null;
+  resets_at?: string | null;
+}
+
 interface UsageData {
   five_hour?: RateLimit;
   seven_day?: RateLimit;
   seven_day_sonnet?: RateLimit;
+  limits?: UsageLimit[];
   extra_usage?: ExtraUsage;
+}
+
+// ─── Config ───────────────────────────────────────────────────────────────────
+
+const USAGE_ITEMS = [
+  "session",
+  "weekly",
+  "weekly_scoped",
+  "session_reset",
+  "weekly_reset",
+  "reset",
+  "extra",
+] as const;
+
+type UsageItem = (typeof USAGE_ITEMS)[number];
+type PercentItem = "session" | "weekly" | "weekly_scoped";
+
+interface StatusConfig {
+  items: UsageItem[];
+  labels: Record<PercentItem, string>;
+}
+
+const CONFIG_PATH = join(getAgentDir(), "pi-status.json");
+
+const DEFAULT_CONFIG: StatusConfig = {
+  items: ["session", "weekly", "reset"],
+  labels: { session: "5h", weekly: "7d", weekly_scoped: "ws" },
+};
+
+function isUsageItem(value: unknown): value is UsageItem {
+  return USAGE_ITEMS.includes(value as UsageItem);
+}
+
+function loadConfig(): StatusConfig {
+  let raw: any;
+  try {
+    raw = JSON.parse(readFileSync(CONFIG_PATH, "utf8"));
+  } catch {
+    return DEFAULT_CONFIG;
+  }
+  return {
+    items: Array.isArray(raw?.items)
+      ? raw.items.filter(isUsageItem)
+      : DEFAULT_CONFIG.items,
+    labels: { ...DEFAULT_CONFIG.labels, ...raw?.labels },
+  };
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -85,43 +141,109 @@ async function fetchUsage(token: string): Promise<UsageData> {
 
 // ─── Compact rendering helpers ────────────────────────────────────────────────
 
-function worstPct(data: UsageData): number {
-  const vals = [
-    data.five_hour?.utilization,
-    data.seven_day?.utilization,
-  ].filter((v): v is number => typeof v === "number");
-  return vals.length ? Math.max(...vals) : 0;
+interface UsageWindow {
+  percent: number | null;
+  resetsAt: string | null;
 }
 
-function fmtLimit(label: string, limit?: RateLimit): string | null {
-  if (!limit || limit.utilization === null || limit.utilization === undefined)
-    return null;
-  return `${label}:${Math.floor(limit.utilization)}%`;
+interface UsagePart {
+  text: string;
+  percent?: number;
 }
 
-function fmtReset(resets_at?: string | null): string | null {
-  if (!resets_at) return null;
-  const ms = new Date(resets_at).getTime() - Date.now();
+function findWindow(
+  data: UsageData,
+  kind: LimitKind,
+  legacy?: RateLimit,
+): UsageWindow | null {
+  // Assumes one limit per kind. weekly_scoped is currently a single
+  // model-scoped limit (Fable); if several appear, render one part per
+  // limit, labelled from scope.model.display_name.
+  const limit = data.limits?.find((l) => l.kind === kind);
+  if (limit) return { percent: limit.percent, resetsAt: limit.resets_at ?? null };
+  if (legacy) {
+    return { percent: legacy.utilization, resetsAt: legacy.resets_at ?? null };
+  }
+  return null;
+}
+
+function sessionWindow(data: UsageData): UsageWindow | null {
+  return findWindow(data, "session", data.five_hour);
+}
+
+function weeklyWindow(data: UsageData): UsageWindow | null {
+  return findWindow(data, "weekly_all", data.seven_day);
+}
+
+function fmtDuration(resetsAt: string): string {
+  const ms = new Date(resetsAt).getTime() - Date.now();
   if (ms <= 0) return "now";
-  const totalSec = Math.floor(ms / 1000);
-  const h = Math.floor(totalSec / 3600);
-  const m = Math.floor((totalSec % 3600) / 60);
+  const totalMin = Math.floor(ms / 60_000);
+  const d = Math.floor(totalMin / 1440);
+  const h = Math.floor((totalMin % 1440) / 60);
+  const m = totalMin % 60;
+  if (d > 0) return `${d}d${h}h`;
   if (h > 0) return `${h}h${m}m`;
   return `${m}m`;
 }
 
-function buildParts(data: UsageData): string[] {
-  const parts = [
-    fmtLimit("5h", data.five_hour),
-    fmtLimit("7d", data.seven_day),
-  ].filter((p): p is string => p !== null);
+function percentPart(label: string, window: UsageWindow | null): UsagePart | null {
+  if (typeof window?.percent !== "number") return null;
+  const percent = Math.floor(window.percent);
+  return { text: `${label}:${percent}%`, percent };
+}
 
-  // Show soonest reset time (prefer 5-hour window if active)
-  const resetStr =
-    fmtReset(data.five_hour?.resets_at) ?? fmtReset(data.seven_day?.resets_at);
-  if (resetStr) parts.push(`↺${resetStr}`);
+function resetPart(resetsAt: string | null | undefined): UsagePart | null {
+  return resetsAt ? { text: `↺${fmtDuration(resetsAt)}` } : null;
+}
 
-  return parts;
+function soonestReset(data: UsageData): string | null {
+  const times = [sessionWindow(data)?.resetsAt, weeklyWindow(data)?.resetsAt]
+    .filter((t): t is string => !!t)
+    .sort((a, b) => new Date(a).getTime() - new Date(b).getTime());
+  return times[0] ?? null;
+}
+
+function extraPart(extra?: ExtraUsage): UsagePart | null {
+  if (!extra?.is_enabled) return null;
+  const used = extra.used_credits;
+  const limit = extra.monthly_limit;
+  if (typeof used !== "number" || typeof limit !== "number") return null;
+  const text = `$${(used / 100).toFixed(2)}/$${(limit / 100).toFixed(2)}`;
+  return limit > 0 ? { text, percent: Math.floor((used / limit) * 100) } : { text };
+}
+
+function buildPart(
+  item: UsageItem,
+  data: UsageData,
+  labels: StatusConfig["labels"],
+): UsagePart | null {
+  switch (item) {
+    case "session":
+      return percentPart(labels.session, sessionWindow(data));
+    case "weekly":
+      return percentPart(labels.weekly, weeklyWindow(data));
+    case "weekly_scoped":
+      return percentPart(labels.weekly_scoped, findWindow(data, "weekly_scoped"));
+    case "session_reset":
+      return resetPart(sessionWindow(data)?.resetsAt);
+    case "weekly_reset":
+      return resetPart(weeklyWindow(data)?.resetsAt);
+    case "reset":
+      return resetPart(soonestReset(data));
+    case "extra":
+      return extraPart(data.extra_usage);
+  }
+}
+
+function buildParts(data: UsageData, config: StatusConfig): UsagePart[] {
+  return config.items
+    .map((item) => buildPart(item, data, config.labels))
+    .filter((p): p is UsagePart => p !== null);
+}
+
+function worstPercent(parts: UsagePart[]): number {
+  return Math.max(0, ...parts.map((p) => p.percent ?? 0));
 }
 
 // ─── Extension ────────────────────────────────────────────────────────────────
@@ -136,6 +258,8 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", (_event, ctx) => {
     stopPolling?.();
+
+    const config = loadConfig();
 
     // cc-usage polling state
     let usageData: UsageData | null = null;
@@ -292,15 +416,16 @@ export default function (pi: ExtensionAPI) {
           let usagePlain = "";
           let usageColored = "";
           if (usageData) {
-            const parts = buildParts(usageData);
+            const parts = buildParts(usageData, config);
             if (parts.length > 0) {
-              const text = "  " + parts.join(" ");
+              const joined = parts.map((p) => p.text).join(" ");
+              const text = "  " + joined;
               usagePlain = text;
-              const worst = worstPct(usageData);
+              const worst = worstPercent(parts);
               if (worst >= 80) {
-                usageColored = "  " + theme.fg("error", parts.join(" "));
+                usageColored = "  " + theme.fg("error", joined);
               } else if (worst >= 50) {
-                usageColored = "  " + theme.fg("warning", parts.join(" "));
+                usageColored = "  " + theme.fg("warning", joined);
               } else {
                 usageColored = theme.fg("dim", text);
               }
